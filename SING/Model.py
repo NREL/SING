@@ -1,0 +1,391 @@
+from pybase64 import b64decode
+from shapely import geometry
+import networkx as nx
+import pandas as pd
+import numpy as np
+import osmnx as ox
+import easygui
+import pickle
+import math
+import mpu
+import os
+import io
+
+from bokeh.models import Button, ColumnDataSource, Slider, TextInput, MultiLine, Plot, Button, Select, Div
+from bokeh.models.widgets import FileInput
+from bokeh.plotting import figure, output_file, curdoc
+from bokeh.tile_providers import get_provider, OSM
+from bokeh.events import SelectionGeometry
+from bokeh.layouts import column, row, Spacer
+from bokeh.palettes import brewer
+#
+
+from SING.Secondary import SecondaryModel
+from SING.Primary import PrimaryModel
+from SING.common import Conductors
+from SING.OpenDSS import Model
+import matplotlib.pyplot as plt
+
+class DistributionModel:
+    def __init__(self):
+        self.export_directory = None
+        self.load_data_df = pd.DataFrame()
+        TOOLS = "hover,pan,wheel_zoom,zoom_in,zoom_out,box_zoom,redo,reset,box_select,lasso_select,"
+        self.originShift = 2 * math.pi * 6378137 / 2.0
+        self.base_path = os.path.abspath(__file__).lower()
+        tile_provider = get_provider(OSM)
+
+        print(f"Base path: {self.base_path}")
+        substation_file = self.base_path.replace("model.py", "data_sources/substations.csv")
+        print(f"Substation_file: {substation_file}")
+        self.substations = pd.read_csv(substation_file, index_col=2)
+        self.s1 = ColumnDataSource(
+            data=dict(
+                X=[0], #self.substations["X"].tolist(),
+                Y=[0], #self.substations["Y"].tolist(),
+            )
+        )
+        # range bounds supplied in web mercator coordinates
+
+        self.buildings_source = ColumnDataSource(
+            data=dict(
+                X=[0],
+                Y=[0],
+                C=["blue"],
+                D=["residential"]
+            )
+        )
+
+        TOOLTIPS = [
+            ("index", "$index"),
+            ("Building Type", "@D"),
+        ]
+
+        self.p = figure(
+            x_range=(-14000000, -8000000),
+            y_range=(2500000, 7000000),
+            x_axis_type="mercator",
+            y_axis_type="mercator",
+            plot_width=1545,
+            plot_height=700,
+            tools=TOOLS,
+            tooltips=TOOLTIPS,
+        )
+
+        self.model_created = False
+
+        self.p.add_tile(tile_provider)
+        self.p.outline_line_color = None
+        self.p.grid.grid_line_color = None
+
+        self.graph_source = ColumnDataSource(
+            data=dict(
+                xs=[[0, 0]],
+                ys=[[0, 0]],
+            )
+        )
+
+        self.graph = self.p.multi_line(xs="xs", ys="ys", line_color="#8073ac", line_width=2, source=self.graph_source)
+
+        self.subs = self.p.circle(x='X', y='Y', size=5, alpha=1.0, source=self.s1, legend_label="Substations")
+        self.buildings = self.p.inverted_triangle(
+            x='X', y='Y', color="C", size=5, alpha=0.7, source=self.buildings_source, legend_label="Buildings"
+        )
+        self.p.on_event(SelectionGeometry, self.lasso_callback)
+
+        #prim_offset, prim_pole_distance, prim_line_thresh, sec_houses_per_pole, sec_buildings_per_cluster
+
+        self.offset = TextInput(value="3", title="Pole displacement from road - ft")
+        self.pole_distance = TextInput(value="100", title="Average distance between poles - ft")
+        self.line_thresh = TextInput(value="50", title="Node merge threshold- ft")
+
+        self.houses_per_pole = Slider(start=2, end=5, value=2, step=1, title="Average houses per pole")
+        self.buildings_per_cluster = Slider(start=2, end=10, value=3, step=1, title="Average houses per XFMR")
+        self.alpha = Slider(start=0, end=1, value=0.5, step=0.01, title="Centroid constant")
+
+        self.hv_voltage = Slider(start=69.0, end=500.0, value=115.0, step=1.0, title="High voltage (kV)")
+        self.mv_voltage = Slider(start=1.0, end=60.0, value=12.47, step=.01, title="Medium voltage (kV)")
+
+        self.circuit_name = TextInput(value="default_circuit", title="OpenDSS circuit name (no spaces)")
+        self.file_name = TextInput(value="main", title="OpenDSS file name (no spaces)")
+
+        conds = [f"{k}  {v['MAT']}" for k, v in Conductors.items()]
+
+        self.primary_conductor = Select(title="Primary conductor", options=conds, value="2/0  ACSR")
+        self.secondary_conductor = Select(title="Secondary conductor", options=conds, value="4  ACSR")
+        self.load_file_input = FileInput(accept=".csv", width_policy="fit")
+        self.export_path_input = Button(label='Select export folder')
+        self.export_path_input.on_click(self.create_folder_popup)
+        
+        label1  =  Div(text="""Import loads file""")
+        label3  =  Div(text="""Select region before clicking""")
+        self.load_file_input.on_change('value', self.read_load_data)
+        
+
+        self.export_model = Button(label='Create distribution model')
+        self.export_model.on_click(self.button_clicked)
+
+        # slider.js_on_change("value", CustomJS(code="""
+        #     console.log('slider: value=' + this.value, this.toString())
+        # """))
+        R1 = row(self.offset, self.pole_distance, self.line_thresh, self.circuit_name, self.file_name)
+        R2 = row(self.houses_per_pole, self.buildings_per_cluster, self.alpha, self.hv_voltage, self.mv_voltage)
+        C1 = column(label1, self.load_file_input)
+        C3 = column(label3, row(self.export_path_input, self.export_model))
+        R3 = row(self.primary_conductor, self.secondary_conductor,C1, C3)
+
+
+        curdoc().theme = 'dark_minimal'
+        curdoc().add_root(column(R1, R2, R3, self.p))
+        return
+    def create_folder_popup(self):   
+        self.export_directory = easygui.diropenbox()
+
+    def read_load_data(self, attr, old, new):
+        decoded = b64decode(new)
+        f = io.BytesIO(decoded)
+        self.load_data_df = pd.read_csv(f)
+        return
+
+    def create_model(self):
+        return
+
+    def get_substations_in_polygon(self, polygon):
+        coordinates = []
+        for x, y in zip(self.substations["X"].tolist(), self.substations["Y"].tolist()):
+            LongLat = self.MetersToLatLon(x, y)
+            P = geometry.Point(LongLat)
+            if P.within(polygon):
+                coordinates.append(LongLat)
+        if self.export_directory:
+            substations_file = os.path.join(self.export_directory, "substations.txt")
+            textfile = open(substations_file, "w")
+            for element in coordinates:
+                text = ",".join([str(e) for e in element])
+                textfile.write(text + "\n")
+            textfile.close()
+        else:
+            print("Select an export directory first!")
+        
+
+        return coordinates
+
+    def get_buildings_data(self, polygon):
+        self.building_data = {}
+        self.B = ox.geometries_from_polygon(polygon, tags={"building": True})
+        for idx, row in self.B.iterrows():
+            x, y = self.LatLonToMeters(
+                row["geometry"].centroid.y,
+                row["geometry"].centroid.x
+            )
+            self.building_data[idx[1]] = {
+                "X": x,
+                "Y": y,
+                "Floors": row["building:levels"] if "building:levels" in row else 1,
+                "Area": row["geometry"].area,
+                "Type": row["building"],
+            }
+        self.building_data = pd.DataFrame(self.building_data).T
+        building_types = list(set(self.building_data["Type"].tolist()))
+        N = len(building_types)
+        if N < 3:
+            pallette = brewer['Spectral'][3][:-1]
+        elif N>=3 and N<=11:
+            pallette = brewer['Spectral'][N]
+        else:
+            pallette = []
+            nn = math.ceil(N / 11)
+            for i in range(nn):
+                pallette.extend(brewer['Spectral'][11])
+            pallette = pallette[:N]
+
+        Colors = dict(zip(building_types, pallette))
+        if self.export_directory:
+            buildings_file = os.path.join(self.export_directory, "buildings.csv")
+            self.building_data.to_csv(buildings_file)
+            self.building_data["Color"] = self.building_data["Type"]
+
+            self.buildings_source.data = dict(
+                X=self.building_data["X"].tolist(),
+                Y=self.building_data["Y"].tolist(),
+                C=[Colors[T] for T in self.building_data["Type"]],
+                D=self.building_data["Type"].tolist()
+            )
+            self.buildings.data_source = self.buildings_source
+            return self.building_data
+        else:
+            print("Select an export directory first!")
+
+    def lasso_callback(self, event):
+        self.model_created = False
+        self.alpha_mult = float(self.alpha.value)
+        self.prim_offset = float(self.offset.value)
+        self.prim_line_thresh = float(self.line_thresh.value)
+        self.prim_pole_distance = float(self.pole_distance.value)
+        self.sec_houses_per_pole = [int(self.houses_per_pole.value)]
+        self.sec_buildings_per_cluster = [int(self.buildings_per_cluster.value)]
+
+        print("Settings")
+        print(f"Pole displacement from road - ft: {self.prim_offset}")
+        print(f"Average distance between poles - ft: {self.prim_pole_distance}")
+        print(f"Node merge threshold - ft: {self.prim_line_thresh}")
+        print(f"Average houses per pole: {self.sec_houses_per_pole}")
+        print(f"Average houses per XFMR: {self.sec_buildings_per_cluster}")
+
+        if event.final:
+            if "x1" in event.geometry:
+                xs = [event.geometry['x0'], event.geometry['x0'], event.geometry['x1'], event.geometry['x1']]
+                ys = [event.geometry['y0'], event.geometry['y1'], event.geometry['y1'], event.geometry['y0']]
+            else:
+                xs = event.geometry['x']
+                ys = event.geometry['y']
+            if isinstance(xs, list):
+                Coordinates = []
+                for x, y in zip(xs, ys):
+                    LongLat = self.MetersToLatLon(x, y)
+                    Coordinates.append(LongLat)
+                polygon = geometry.Polygon(Coordinates)
+                self.G = ox.graph_from_polygon(polygon, network_type='drive')
+
+                SubstationCoords = self.get_substations_in_polygon(polygon)
+
+                if len(SubstationCoords):
+                    print(f"{len(SubstationCoords)} Substations found in selected area")
+                    X = []
+                    Y = []
+
+                    for x, y in SubstationCoords:
+                        x, y = self.LatLonToMeters(y, x)
+                        X.append(x)
+                        Y.append(y)
+
+                    self.s1.data = dict(
+                        X=X,
+                        Y=Y,
+                    )
+                    self.subs.data_source = self.s1
+                    buildingData = self.get_buildings_data(polygon)
+                    
+                    Primary = PrimaryModel(self.G, SubstationCoords)
+                    print("Building primary model")
+                    Primaries = Primary.build(self.prim_offset, self.prim_pole_distance, self.prim_line_thresh)
+                    print("Primary model: ", Primaries)
+                   
+                    primary_positions = nx.get_node_attributes(Primaries, 'pos')
+
+                    print("Building secondary model")
+                    Secondary = SecondaryModel(buildingData, SubstationCoords)
+                    secData = Secondary.build(
+                        buildingsPerCluster=self.sec_buildings_per_cluster,
+                        HousesPerPole=self.sec_houses_per_pole
+                    )
+                    print("Secondary model build complete")
+                
+                    
+                    K = [k.split("_") for k in secData.keys()]
+                    for B, H in K:
+                        B = int(B)
+                        H = int(H)
+                        infrastructure = secData[f"{B}_{H}"]["infrastructure"]
+                        #infrastructure = Secondary.allign_infrastructure_to_road(infrastructure, self.G)
+                        infrastructure = Secondary.centroid(infrastructure, self.G, self.alpha_mult)
+                        print("Creating secondary model")
+                        secondaries, xfmrs, self.xfmr_mapping = Secondary.create_secondaries(infrastructure, secData[f"{B}_{H}"]["buildings"], B, H)
+                        print("Secondary model: ", secondaries)
+                        self.building_data_ = secData[f"{B}_{H}"]["buildings"]
+                        self.complete_model = nx.compose(Primaries, secondaries)
+                        self.complete_model = self.stitch_graphs(self.complete_model, xfmrs, primary_positions)
+                        print("Complete model: ", self.complete_model)
+
+                        self.plot_graph(self.complete_model)
+                    self.model_created = True
+                    print("Network creation is complete!")
+                else:
+                    print("No substation found in selected area")
+
+    def button_clicked(self):
+        if self.load_data_df.empty:
+            print("load a data file before building the model")
+            return
+        
+        if not self.export_directory:
+            print("Select an export folder before building a model")
+            return
+        
+        if self.model_created:
+            model_path = os.path.join(self.export_directory, f"{self.file_name.value}.gpickle")
+            nx.write_gpickle(self.complete_model, model_path)
+            M = Model(
+                Buildings=self.xfmr_mapping,
+                Circuit=self.circuit_name.value,
+                Model=self.complete_model,
+                File=self.file_name.value,
+                HV=self.hv_voltage.value,
+                MV=self.mv_voltage.value,
+                PC=self.primary_conductor.value,
+                SC=self.secondary_conductor.value,
+            )
+            M.Write(self.export_directory, self.load_data_df)
+            print("Model is valid")
+        else:
+            print("There is no model")
+
+
+    def plot_graph(self, graph):
+        xs = []
+        ys = []
+        for u, v in graph.edges():
+            u_attr = graph.nodes[u]["pos"]
+            x1, y1 = self.LatLonToMeters(u_attr[1], u_attr[0])
+            v_attr = graph.nodes[v]["pos"]
+            x2, y2 = self.LatLonToMeters(v_attr[1], v_attr[0])
+            xs.append([x1 + self.prim_offset, x2 + self.prim_offset])
+            ys.append([y1 + self.prim_offset, y2 + self.prim_offset])
+
+        self.graph_source.data = dict(
+            xs=xs,
+            ys=ys,
+        )
+
+        self.graph.data_source = self.graph_source
+        return
+
+    def stitch_graphs(self, G, xfmr, primaries):
+        for u , u_pos in xfmr.items():
+            D = np.inf
+            v_f = None
+            for v, v_pos in primaries.items():
+                d = mpu.haversine_distance(np.flip(u_pos), np.flip(v_pos))
+                if d < D:
+                    D = d
+                    v_f = v
+            attrs = {"length": D}
+            G.add_edge(u, v_f, **attrs)
+        return G
+
+    def merc(self, lat, lon):
+        r_major = 6378137.000
+        x = r_major * math.radians(lon)
+        scale = x/lon
+        y = 180.0/math.pi * math.log(math.tan(math.pi/4.0 + lat * (math.pi/180.0)/2.0)) * scale
+        return x, y
+
+    def LatLonToMeters(self, lat, lon):
+        #"""Converts given lat/lon in WGS84 Datum to XY in Spherical Mercator EPSG:900913"""
+
+        mx = lon * self.originShift / 180.0
+        my = math.log(math.tan((90 + lat) * math.pi / 360.0)) / (math.pi / 180.0)
+
+        my = my * self.originShift / 180.0
+        return mx, my
+
+    def MetersToLatLon(self, mx, my):
+        #"""Converts XY point from Spherical Mercator EPSG:900913 to lat/lon in WGS84 Datum"""
+
+        lon = (mx / self.originShift) * 180.0
+        lat = (my / self.originShift) * 180.0
+
+        lat = 180 / math.pi * (2 * math.atan(math.exp(lat * math.pi / 180.0)) - math.pi / 2.0)
+        return lon, lat
+
+a = DistributionModel()
