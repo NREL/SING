@@ -8,7 +8,7 @@ SING installation requires Python Anaconda,.
 
 The repository can be cloned using the following command within a command prompt window
 
-- git clone https://github.nrel.gov/alatif/SING.git
+- git clone https://github.com/NREL/SING.git
 
 A new conda environment can be created using the following command
 
