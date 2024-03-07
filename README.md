@@ -23,7 +23,7 @@ Finally, the module can be installed using the command within the cloned repo di
 
 The SING app can be launched using the following command within the cloned repo directory
 
-- bokeh serve model.py
+- bokeh serve Model.py
 
 # License
 
